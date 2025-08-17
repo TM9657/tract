@@ -1,17 +1,18 @@
 use tract_core::internal::*;
 use tract_core::ops::array::{MultiBroadcastTo, Slice, TypedConcat};
-use tract_core::ops::cast::wire_cast;
+use tract_core::ops::cast::{cast, wire_cast};
 use tract_core::ops::Downsample;
 use tract_core::prelude::tract_itertools::Itertools;
-use tract_ndarray::ArrayView2;
+use tract_ndarray::{Array4, ArrayView2};
 
 use crate::registry::{DeserOp, Registry};
 use crate::ser::{BuiltinOp, SubgraphBuilder};
 use crate::tflite::{
-    ActivationFunctionType, BuiltinOperator, BuiltinOptions, ConcatenationOptions,
-    ConcatenationOptionsArgs, ExpandDimsOptions, ExpandDimsOptionsArgs, ReshapeOptions,
-    ReshapeOptionsArgs, SliceOptions, SliceOptionsArgs, SqueezeOptions, SqueezeOptionsArgs,
-    StridedSliceOptions, StridedSliceOptionsArgs, TransposeOptions, TransposeOptionsArgs,
+    ActivationFunctionType, BuiltinOperator, BuiltinOptions, CastOptions, ConcatenationOptions,
+    ConcatenationOptionsArgs, ExpandDimsOptions, ExpandDimsOptionsArgs, ResizeBilinearOptions,
+    ReshapeOptions, ReshapeOptionsArgs, SliceOptions, SliceOptionsArgs, SqueezeOptions,
+    SqueezeOptionsArgs, StridedSliceOptions, StridedSliceOptionsArgs, TensorType, TransposeOptions,
+    TransposeOptionsArgs,
 };
 
 use super::wire_fused_activation;
@@ -24,10 +25,12 @@ pub fn register_all(reg: &mut Registry) {
     reg.reg_to_tflite(ser_slice);
 
     reg.reg_to_tract(BuiltinOperator::BROADCAST_TO, de_broadcast_to);
+    reg.reg_to_tract(BuiltinOperator::CAST, de_cast);
     reg.reg_to_tract(BuiltinOperator::CONCATENATION, de_concat);
     reg.reg_to_tract(BuiltinOperator::EXPAND_DIMS, de_expand_dims);
     reg.reg_to_tract(BuiltinOperator::PAD, de_pad);
     reg.reg_to_tract(BuiltinOperator::PADV2, de_padv2);
+    reg.reg_to_tract(BuiltinOperator::RESIZE_BILINEAR, de_resize_bilinear);
     reg.reg_to_tract(BuiltinOperator::RESHAPE, de_reshape);
     reg.reg_to_tract(BuiltinOperator::SHAPE, de_shape);
     reg.reg_to_tract(BuiltinOperator::SLICE, de_slice);
@@ -364,4 +367,96 @@ fn ser_slice(
         BuiltinOp::new(65, 1, BuiltinOperator::SLICE, BuiltinOptions::SliceOptions),
         options.as_union_value(),
     )
+}
+
+fn de_cast(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
+    let options = builtin!(op, builtin_options_as_cast_options);
+    let out_dt: DatumType = options.out_data_type().try_into()?;
+    wire_cast(op.prefix, op.ctx.target, op.inputs, out_dt)
+}
+
+#[derive(Clone, Debug, Hash)]
+struct ResizeBilinear {
+    h: usize,
+    w: usize,
+    align_corners: bool,
+    half_pixel_centers: bool,
+}
+
+impl Op for ResizeBilinear {
+    fn name(&self) -> StaticName { "ResizeBilinear".into() }
+    impl_op_same_as!();
+    op_as_typed_op!();
+}
+
+impl EvalOp for ResizeBilinear {
+    fn is_stateless(&self) -> bool { true }
+    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        let input = args_1!(inputs);
+        let i = input.to_array_view::<f32>()?;
+        let n = i.shape()[0];
+        let hi = i.shape()[1];
+        let wi = i.shape()[2];
+        let c = i.shape()[3];
+        let mut o = Array4::<f32>::zeros((n, self.h, self.w, c));
+        for b in 0..n {
+            for y in 0..self.h {
+                let in_y = if self.align_corners {
+                    if self.h == 1 { 0.0 } else { y as f32 * (hi as f32 - 1.0) / (self.h as f32 - 1.0) }
+                } else if self.half_pixel_centers {
+                    ((y as f32 + 0.5) * hi as f32 / self.h as f32) - 0.5
+                } else {
+                    y as f32 * hi as f32 / self.h as f32
+                };
+                let y0 = in_y.floor().max(0.0) as usize;
+                let y1 = (y0 + 1).min(hi - 1);
+                let y_lerp = in_y - y0 as f32;
+                for x in 0..self.w {
+                    let in_x = if self.align_corners {
+                        if self.w == 1 { 0.0 } else { x as f32 * (wi as f32 - 1.0) / (self.w as f32 - 1.0) }
+                    } else if self.half_pixel_centers {
+                        ((x as f32 + 0.5) * wi as f32 / self.w as f32) - 0.5
+                    } else {
+                        x as f32 * wi as f32 / self.w as f32
+                    };
+                    let x0 = in_x.floor().max(0.0) as usize;
+                    let x1 = (x0 + 1).min(wi - 1);
+                    let x_lerp = in_x - x0 as f32;
+                    for ch in 0..c {
+                        let top = i[[b, y0, x0, ch]] * (1. - x_lerp)
+                            + i[[b, y0, x1, ch]] * x_lerp;
+                        let bottom = i[[b, y1, x0, ch]] * (1. - x_lerp)
+                            + i[[b, y1, x1, ch]] * x_lerp;
+                        o[[b, y, x, ch]] = top * (1. - y_lerp) + bottom * y_lerp;
+                    }
+                }
+            }
+        }
+        Ok(tvec!(o.into_tvalue()))
+    }
+}
+
+impl TypedOp for ResizeBilinear {
+    as_op!();
+    fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
+        ensure!(inputs.len() == 1);
+        let mut fact = inputs[0].without_value();
+        fact.shape.set(1, self.h.to_dim());
+        fact.shape.set(2, self.w.to_dim());
+        Ok(tvec!(fact))
+    }
+}
+
+fn de_resize_bilinear(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
+    let (_input, size) = args_2!(op.facts()?);
+    let size = size.konst.as_ref().context("Dynamic RESIZE_BILINEAR is not supported")?;
+    let size = size.as_slice::<i32>()?;
+    let options = builtin!(op, builtin_options_as_resize_bilinear_options);
+    let rb = ResizeBilinear {
+        h: size[0] as usize,
+        w: size[1] as usize,
+        align_corners: options.align_corners(),
+        half_pixel_centers: options.half_pixel_centers(),
+    };
+    op.ctx.target.wire_node(op.prefix, rb, &op.inputs[0..1])
 }
