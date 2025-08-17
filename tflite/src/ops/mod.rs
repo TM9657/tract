@@ -118,6 +118,14 @@ fn linearops_quantization_suport(
         }
         let k_scales = k_scales_opt.unwrap();
         let k_zps = k_zps_opt.unwrap();
+        // Debug: print kernel quantization raw arrays for diagnosis
+        eprintln!(
+            "Importer debug (linearops): kernel scales len={} first4={:?} zps len={} first4={:?}",
+            k_scales.len(),
+            (0..k_scales.len().min(4)).map(|i| k_scales.get(i)).collect::<Vec<_>>(),
+            k_zps.len(),
+            (0..k_zps.len().min(4)).map(|i| k_zps.get(i)).collect::<Vec<_>>()
+        );
         let k_scale = if k_scales.len() > 1 {
             rctensor1(&k_scales.iter().collect_vec())
         } else {

@@ -172,9 +172,16 @@ fn ser_conv(
         } else {
             inputs.push(builder.map_outlet(model, node.inputs[1])?);
             let bias = facts[2].konst.as_ref().context("FIXME: Dumper require constant bias")?;
+            // Debug: print bias datum type and first elements to help track weird large ints
+            eprintln!("Importer debug: conv '{}' bias fact dtype={:?} qparams={:?}", node_name, facts[2].datum_type, facts[2].datum_type.qparams());
+            if let Some(b_slice) = bias.as_slice::<i32>().ok() {
+                let sample: Vec<i32> = b_slice.iter().take(10).cloned().collect();
+                eprintln!("Importer debug: bias sample first 10 i32 = {:?}", sample);
+            }
             let bias_qdt = bias
                 .datum_type()
                 .quantize(QParams::ZpScale { zero_point: 0, scale: iscale * kscale[0] });
+            eprintln!("Importer debug: conv '{}' bias_qdt={:?}", node_name, bias_qdt);
             let bias = bias.cast_to_dt(bias_qdt)?.into_owned();
             inputs.push(builder.write_fact(format!("{node_name}.bias"), bias)?);
         }
@@ -259,10 +266,74 @@ fn de_conv2d(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
     };
     let mut inputs = tvec!(op.inputs[0], op.inputs[1], op.inputs[2]);
     let q_params = super::linearops_quantization_suport(op, &input, &mut inputs)?;
-    let bias_dt = bias.datum_type.unquantized();
-    inputs[2] =
-        op.ctx.target.wire_node(format!("{}.cast_bias", op.prefix), cast(bias_dt), &[inputs[2]])?
-            [0];
+    // If quantized path, ensure bias is an I32 constant quantized with scale iscale * kscale[0]
+    if q_params.is_some() {
+        // try to obtain iscale and first kscale from the flatbuffer like linearops_quantization_suport
+        let mut iscale_opt: Option<f32> = None;
+        let mut kscale0_opt: Option<f32> = None;
+        if let Some(flat_inputs) = op.flat.inputs() {
+            let i_input = flat_inputs.get(0);
+            let i_tensor = op.ctx.subgraph.tensors().unwrap().get(i_input as usize);
+            if let Some(i_qp) = i_tensor.quantization() {
+                if let (Some(sv), Some(_zv)) = (i_qp.scale(), i_qp.zero_point()) {
+                    if sv.len() == 1 {
+                        iscale_opt = Some(sv.get(0));
+                    }
+                }
+            } else if let Some(iqp) = input.datum_type.qparams() {
+                iscale_opt = Some(iqp.zp_scale().1);
+            }
+            let k_input = flat_inputs.get(1);
+            let k_tensor = op.ctx.subgraph.tensors().unwrap().get(k_input as usize);
+            if let Some(k_qp) = k_tensor.quantization() {
+                if let Some(k_scales) = k_qp.scale() {
+                    if k_scales.len() >= 1 {
+                        kscale0_opt = Some(k_scales.get(0));
+                    }
+                }
+            }
+        }
+        if let (Some(iscale), Some(ks0)) = (iscale_opt, kscale0_opt) {
+            // If bias is a float constant, quantize and replace with i32 const
+            if let Some(konst) = bias.konst.as_ref() {
+                if let Ok(slice_f) = konst.as_slice::<f32>() {
+                    let scale = iscale * ks0;
+                    let vec_i: Vec<i32> = slice_f.iter().map(|v| ((*v as f32) / scale).round() as i32).collect();
+                    let shape_vec: Vec<usize> = konst.shape().iter().cloned().collect();
+                    let arr = tract_ndarray::Array::from_shape_vec(shape_vec.clone(), vec_i).unwrap();
+                    let tensor = arr.into_tensor().into_arc_tensor();
+                    // replace inputs[2] with this constant
+                    let name = format!("{}.bias", op.prefix);
+                    let cid = op.ctx.target.add_const(name, tensor)?;
+                    inputs[2] = cid;
+                    // mark that we replaced bias so downstream cast uses correct target dtype
+                    // (we cannot modify the original `bias` fact returned by op.facts()).
+                    // We'll use a localized flag below.
+                }
+            }
+        }
+    }
+    // If we replaced the bias with a new constant above, inputs[2] will differ from the
+    // original op.inputs[2]. In that case, treat the bias datatype as i32 to avoid
+    // casting the already-quantized i32 bias back to f32.
+    let replaced_bias = inputs[2] != op.inputs[2];
+    // Debug: inspect bias fact and samples before casting to catch raw buffer interpretation issues.
+    eprintln!("Importer debug (de_conv2d): node '{}' bias fact dtype={:?} qparams={:?}", op.prefix, bias.datum_type, bias.datum_type.qparams());
+    if let Some(konst) = bias.konst.as_ref() {
+        if let Ok(b_slice) = konst.as_slice::<i32>() {
+            let sample: Vec<i32> = b_slice.iter().take(10).cloned().collect();
+            eprintln!("Importer debug (de_conv2d): bias sample first 10 i32 = {:?}", sample);
+        } else if let Ok(b_sliceu8) = konst.as_slice::<u8>() {
+            let sample: Vec<u8> = b_sliceu8.iter().take(10).cloned().collect();
+            eprintln!("Importer debug (de_conv2d): bias sample first 10 u8 = {:?}", sample);
+        } else {
+            eprintln!("Importer debug (de_conv2d): bias konst exists but cannot get slice");
+        }
+    } else {
+        eprintln!("Importer debug (de_conv2d): no bias konst available in facts[2]");
+    }
+    let bias_dt = if replaced_bias { i32::datum_type() } else { bias.datum_type.unquantized() };
+    inputs[2] = op.ctx.target.wire_node(format!("{}.cast_bias", op.prefix), cast(bias_dt), &[inputs[2]])?[0];
     let conv = core::cnn::Conv { pool_spec, kernel_fmt: KernelFormat::OHWI, group: 1, q_params };
     let wires = op.ctx.target.wire_node(op.prefix, conv, &inputs)?;
     wire_fused_activation(op, &wires, &options.fused_activation_function())

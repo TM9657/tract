@@ -171,14 +171,45 @@ pub fn flat_tensor_to_tract_fact<'m>(
                     flat.name().unwrap_or("<unnamed>")
                 )
             })?;
-            let mut data = create_tensor(
-                fact.datum_type.unquantized(),
-                shape,
-                data.bytes(),
-            )?;
-            // keep original (possibly quantized) dtype
-            unsafe { data.set_datum_type(dt); }
-            fact = data.into();
+            let bytes = data.bytes();
+            // Heuristic: some TFLite files incorrectly store float32 bytes in tensors
+            // declared as INT32 (e.g. biases). Detect this by sampling a few
+            // elements: if many i32 interpretations are huge while f32
+            // interpretations are small/fine, prefer reading as f32.
+            let mut prefer_f32 = false;
+            if fact.datum_type.unquantized() == DatumType::I32 && bytes.len() >= 4 {
+                use std::convert::TryInto;
+                let elems = shape.iter().product::<usize>();
+                let sample_n = elems.min(8);
+                let mut count_i32_big = 0usize;
+                let mut count_f32_small = 0usize;
+                for i in 0..sample_n {
+                    let off = i * 4;
+                    if off + 4 > bytes.len() { break; }
+                    let v4: [u8; 4] = bytes[off..off + 4].try_into().unwrap();
+                    let as_i32 = i32::from_le_bytes(v4);
+                    let as_f32 = f32::from_le_bytes(v4);
+                    if as_i32.abs() > 1_000_000 { count_i32_big += 1; }
+                    if as_f32.is_finite() && as_f32.abs() < 1_000.0 { count_f32_small += 1; }
+                }
+                if count_i32_big > 0 && count_f32_small > count_i32_big {
+                    prefer_f32 = true;
+                }
+            }
+
+            if prefer_f32 {
+                let mut data = create_tensor(DatumType::F32, shape, bytes)?;
+                fact = data.into();
+            } else {
+                let mut data = create_tensor(
+                    fact.datum_type.unquantized(),
+                    shape,
+                    bytes,
+                )?;
+                // keep original (possibly quantized) dtype
+                unsafe { data.set_datum_type(dt); }
+                fact = data.into();
+            }
         }
     }
 
