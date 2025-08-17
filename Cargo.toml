@@ -150,7 +150,7 @@ flate2 = "1.0.20"
 foreign-types = "0.5"
 fs-err = "2"
 fs2 = "0.4.3"
-getrandom = "0.2"
+getrandom = {version="0.2", features=["js"]}
 half = { version="^2.5", features = [ "std", "num-traits" ] }
 home = "0.5.9"
 icu_collections = "1.5.1"
