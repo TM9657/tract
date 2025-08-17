@@ -92,6 +92,25 @@ fn de_fully_connected(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
         ensure!(b.rank() == 1);
     }
     let mut inputs: TVec<OutletId> = op.inputs.into();
+    // If bias is missing in the inputs (some tflite graphs use -1), create a
+    // default zero bias with the correct output size so quantized path gets
+    // the expected arguments.
+    if bias.is_none() {
+        let weights_shape = weights.shape.as_concrete().context("weights shape must be concrete")?;
+        let out_channels = weights_shape[0].to_usize()?;
+        let zero_bias = op
+            .ctx
+            .target
+            .add_const(format!("{}.bias_default", op.prefix), rctensor1(&vec![0i32; out_channels]))?;
+        if inputs.len() >= 3 {
+            inputs[2] = zero_bias;
+        } else {
+            while inputs.len() < 2 {
+                inputs.push(op.ctx.target.add_const(format!("{}.pad_for_bias", op.prefix), rctensor0(0i32))?);
+            }
+            inputs.push(zero_bias);
+        }
+    }
     let wires = if input.datum_type.is_float() {
         let axes = "BI,OI->BO".parse()?;
         let einsum = EinSum { axes, q_params: None, operating_dt: input.datum_type };
@@ -102,16 +121,38 @@ fn de_fully_connected(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
                 AxisOp::Add(0),
                 &inputs[2..3],
             )?;
+            // Ensure bias has the same datum type as input (e.g. FLOAT32)
+            let bias_cast = wire_cast(
+                format!("{}.bias_cast", op.prefix),
+                op.ctx.target,
+                &[bias[0]],
+                input.datum_type,
+            )?;
             wires = op.ctx.target.wire_node(
                 format!("{}.bias", op.prefix),
                 add(),
-                &[wires[0], bias[0]],
+                &[wires[0], bias_cast[0]],
             )?;
         }
         wires
     } else {
         let qp = super::linearops_quantization_suport(op, &input, &mut inputs)?;
         let axes = "BI,OI,O,,,,,,->BO".parse()?;
+        // Ensure we have the expected 9 inputs (x, w, b, x0, xs, k0, ks, y0, ys).
+        // Some models/exporters may omit some quantization constants; append
+        // reasonable defaults to keep import resilient.
+        while inputs.len() < 9 {
+            let idx = inputs.len();
+            // defaults: zero point ints -> 0, scales -> 1.0
+            let default = match idx {
+                // x0, k0, y0 -> integer zero points
+                3 | 5 | 7 => op.ctx.target.add_const(format!("{}.d{}", op.prefix, idx), rctensor0(0i32))?,
+                // xs, ks, ys -> float scales
+                4 | 6 | 8 => op.ctx.target.add_const(format!("{}.d{}", op.prefix, idx), rctensor0(1f32))?,
+                _ => op.ctx.target.add_const(format!("{}.d{}", op.prefix, idx), rctensor0(0i32))?,
+            };
+            inputs.push(default);
+        }
         let einsum = EinSum { axes, q_params: qp, operating_dt: i32::datum_type() };
         op.ctx.target.wire_node(op.prefix, einsum, &inputs)?
     };

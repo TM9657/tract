@@ -26,6 +26,7 @@ mod cnn;
 mod element_wise;
 mod math;
 mod nn;
+mod quantize;
 
 pub fn register_all(reg: &mut Registry) {
     array::register_all(reg);
@@ -33,6 +34,7 @@ pub fn register_all(reg: &mut Registry) {
     element_wise::register_all(reg);
     math::register_all(reg);
     nn::register_all(reg);
+    quantize::register_all(reg);
     reg.reg_to_tflite(ser_iff);
     reg.reg_to_tract(BuiltinOperator::SELECT, de_iff);
     reg.reg_to_tract(BuiltinOperator::SELECT_V2, de_iff);
@@ -66,24 +68,69 @@ fn linearops_quantization_suport(
 ) -> TractResult<Option<DatumType>> {
     if op.output_facts[0].datum_type.is_quantized() {
         let p = &op.prefix;
-        let iqp = input.datum_type.qparams().unwrap();
+        // Try to obtain input quantization params from the flatbuffer tensor first
+        // (some exported models carry the quantization block in the tensor but
+        // the importer fact might not have been populated). Fall back to the
+        // parsed input fact qparams if needed. If still missing, skip quantized
+        // path.
+        let (i_zp, i_scale) = if let Some(flat_inputs) = op.flat.inputs() {
+            let i_input = flat_inputs.get(0);
+            let i_tensor = op.ctx.subgraph.tensors().unwrap().get(i_input as usize);
+            if let Some(i_qp) = i_tensor.quantization() {
+                let s_opt = i_qp.scale();
+                let z_opt = i_qp.zero_point();
+                if let (Some(sv), Some(zv)) = (s_opt, z_opt) {
+                    if sv.len() == 1 && zv.len() == 1 {
+                        (zv.get(0) as i32, sv.get(0))
+                    } else {
+                        // per-axis input quantization not supported here
+                        return Ok(None);
+                    }
+                } else {
+                    return Ok(None);
+                }
+            } else if let Some(iqp) = input.datum_type.qparams() {
+                let (zp, sc) = iqp.zp_scale();
+                (zp as i32, sc)
+            } else {
+                return Ok(None);
+            }
+        } else if let Some(iqp) = input.datum_type.qparams() {
+            let (zp, sc) = iqp.zp_scale();
+            (zp as i32, sc)
+        } else {
+            return Ok(None);
+        };
         let oqp = op.output_facts[0].datum_type;
         let k_input = op.flat.inputs().unwrap().get(1);
         let k_tensor = op.ctx.subgraph.tensors().unwrap().get(k_input as usize);
-        let k_qp = k_tensor.quantization().unwrap();
-        let k_scale = if k_qp.scale().unwrap().len() > 1 {
-            rctensor1(&k_qp.scale().unwrap().iter().collect_vec())
-        } else {
-            rctensor0(k_qp.scale().unwrap().get(0))
+        // kernel may lack a quantization block in some exported models; if so,
+        // skip quantized path.
+        let k_qp = match k_tensor.quantization() {
+            Some(q) => q,
+            None => return Ok(None),
         };
-        let k_zp = k_qp.zero_point().unwrap().iter().map(|i| i as i32).collect_vec();
+        // ensure kernel quantization has both scales and zero_points
+        let k_scales_opt = k_qp.scale();
+        let k_zps_opt = k_qp.zero_point();
+        if k_scales_opt.is_none() || k_zps_opt.is_none() {
+            return Ok(None);
+        }
+        let k_scales = k_scales_opt.unwrap();
+        let k_zps = k_zps_opt.unwrap();
+        let k_scale = if k_scales.len() > 1 {
+            rctensor1(&k_scales.iter().collect_vec())
+        } else {
+            rctensor0(k_scales.get(0))
+        };
+        let k_zp = k_zps.iter().map(|i| i as i32).collect_vec();
         let k_zp = if k_zp.iter().all_equal() {
             tensor0(k_zp[0])
         } else {
             tensor1(&k_zp)
         };
-        inputs.push(op.ctx.target.add_const(format!("{p}.i0"), rctensor0(iqp.zp_scale().0))?);
-        inputs.push(op.ctx.target.add_const(format!("{p}.iscale"), rctensor0(iqp.zp_scale().1))?);
+    inputs.push(op.ctx.target.add_const(format!("{p}.i0"), rctensor0(i_zp))?);
+    inputs.push(op.ctx.target.add_const(format!("{p}.iscale"), rctensor0(i_scale))?);
         inputs.push(op.ctx.target.add_const(format!("{p}.k0"), k_zp.into_arc_tensor())?);
         inputs.push(op.ctx.target.add_const(format!("{p}.kscale"), k_scale)?);
         inputs.push(op.ctx.target.add_const(format!("{p}.c0"), rctensor0(oqp.zp_scale().0))?);

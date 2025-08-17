@@ -70,6 +70,7 @@ fn main() -> TractResult<()> {
     let mut target_h = 224usize;
     let mut target_w = 224usize;
     let mut as_f32 = true;
+    let mut input_dt: Option<DatumType> = None;
     if let Ok(fact) = model.input_fact(0) {
         if let Some(shape) = fact.shape.as_concrete() {
             let dims: TVec<usize> = shape.into();
@@ -84,28 +85,87 @@ fn main() -> TractResult<()> {
                     target_w = dims[3];
                 }
             }
-        }
-        // decide whether to normalize to 0..1 depending on datum type
-        use tract_core::prelude::DatumType;
-        as_f32 = match fact.datum_type {
-            DatumType::U8 => false,
-            _ => true,
-        };
+    }
+    // decide whether to normalize to 0..1 depending on datum type
+    // quantized / integer inputs should not be normalized to float in [0,1]
+    as_f32 = fact.datum_type.is_float();
+    input_dt = Some(fact.datum_type.clone());
     }
 
     let resized = image::imageops::resize(&img, target_w as u32, target_h as u32, ::image::imageops::FilterType::Triangle);
-    let image_tensor: Tensor = tract_ndarray::Array4::from_shape_fn((1usize, target_h, target_w, 3usize), |(_, y, x, c)| {
-        let v = resized[(x as _, y as _)][c] as f32;
-        if as_f32 { v / 255.0 } else { v }
-    })
-    .into();
+    let image_tensor: Tensor = match input_dt {
+        Some(dt) if dt.is_quantized() => {
+            let (zp, scale) = dt.zp_scale();
+            match dt {
+                DatumType::QU8(_) => {
+                    let a = tract_ndarray::Array4::from_shape_fn((1usize, target_h, target_w, 3usize), |(_, _y, _x, c)| {
+                        // image::RgbImage index is [x][y]
+                        let v = resized[(_x as _, _y as _)][c] as f32;
+                        let pixel = v / 255.0_f32;
+                        let q = (pixel / scale).round() as i32 + zp;
+                        let q = if q < 0 { 0 } else if q > 255 { 255 } else { q };
+                        q as u8
+                    });
+                    let mut t: Tensor = a.into();
+                    let desired = DatumType::U8.with_zp_scale(zp, scale);
+                    t = t.cast_to_dt(desired)?.into_owned();
+                    t
+                }
+                DatumType::QI8(_) => {
+                    let a = tract_ndarray::Array4::from_shape_fn((1usize, target_h, target_w, 3usize), |(_, _y, _x, c)| {
+                        let v = resized[(_x as _, _y as _)][c] as f32;
+                        let pixel = v / 255.0_f32;
+                        let q = (pixel / scale).round() as i32 + zp;
+                        let q = if q < -128 { -128 } else if q > 127 { 127 } else { q };
+                        q as i8
+                    });
+                    let mut t: Tensor = a.into();
+                    let desired = DatumType::I8.with_zp_scale(zp, scale);
+                    t = t.cast_to_dt(desired)?.into_owned();
+                    t
+                }
+                DatumType::QI32(_) => {
+                    let a = tract_ndarray::Array4::from_shape_fn((1usize, target_h, target_w, 3usize), |(_, _y, _x, c)| {
+                        let v = resized[(_x as _, _y as _)][c] as f32;
+                        let pixel = v / 255.0_f32;
+                        let q = (pixel / scale).round() as i32 + zp;
+                        q
+                    });
+                    let mut t: Tensor = a.into();
+                    let desired = DatumType::I32.with_zp_scale(zp, scale);
+                    t = t.cast_to_dt(desired)?.into_owned();
+                    t
+                }
+                _ => {
+                    // Fallback to float if we don't know how to materialize the quantized type
+                    tract_ndarray::Array4::from_shape_fn((1usize, target_h, target_w, 3usize), |(_, y, x, c)| {
+                        let v = resized[(x as _, y as _)][c] as f32;
+                        if as_f32 { v / 255.0 } else { v }
+                    })
+                    .into()
+                }
+            }
+        }
+        _ => tract_ndarray::Array4::from_shape_fn((1usize, target_h, target_w, 3usize), |(_, y, x, c)| {
+            let v = resized[(x as _, y as _)][c] as f32;
+            if as_f32 { v / 255.0 } else { v }
+        })
+        .into(),
+    };
 
     // Now optimize and make runnable, then run the model on the input
     let runnable = model.into_optimized()?.into_runnable()?;
     let result = runnable.run(tvec!(image_tensor.into()))?;
 
+    // Ensure output is float for printing top-1; cast quantized outputs to f32.
+    let output_tensor: Tensor = if result[0].datum_type().is_quantized() {
+        result[0].cast_to::<f32>()?.into_owned()
+    } else {
+        result[0].clone().into_tensor()
+    };
+
     // Print top-1 if float outputs
-    let best = result[0]
+    let best = output_tensor
         .to_array_view::<f32>()?
         .iter()
         .cloned()

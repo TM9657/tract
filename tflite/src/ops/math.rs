@@ -34,13 +34,25 @@ pub fn register_all(reg: &mut Registry) {
 }
 
 fn wire_cast_and_rank_broadcast(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
-    let wire = wire_cast(
-        format!("{}.cast", op.prefix),
-        op.ctx.target,
-        op.inputs,
+    // Try to compute a common super type for inputs.
+    let desired_dt = if let Some(dt) =
         DatumType::super_type_for(op.facts()?.iter().map(|f| f.datum_type))
-            .context("No super type")?,
-    )?;
+    {
+        dt
+    } else {
+        // If no super type found, try to compute a super type on the
+        // unquantized versions of the datum types (preserve integer widths).
+        let facts = op.facts()?;
+        let unq = facts.iter().map(|f| f.datum_type.unquantized());
+        if let Some(dt) = DatumType::super_type_for(unq) {
+            dt
+        } else {
+            // As a last resort, fall back to f32 to keep behaviour stable.
+            f32::datum_type()
+        }
+    };
+
+    let wire = wire_cast(format!("{}.cast", op.prefix), op.ctx.target, op.inputs, desired_dt)?;
     wire_rank_broadcast(op.prefix, op.ctx.target, &wire)
 }
 

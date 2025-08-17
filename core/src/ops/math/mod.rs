@@ -26,7 +26,15 @@ bin_to_super_type!(add, Add,
                    validation: Validation::Rounding,
                    q: [i8, u8, i32, i32] => add_quant;
                    q_op_on_f32: |a: f32, b: f32| -> f32 {a+b},
-                   [f32, i8, i16, i32, i64, u8, u16, u32, u64, f16, f64, TDim, String] => |c, a, b| *c = a.clone() + b);
+                   // floats and generic types keep normal +
+                   [f32, f16, f64, TDim, String] => |c, a, b| *c = a.clone() + b,
+                   // integer additions must promote and clamp to avoid overflow panics
+                   [i8, i16, i32, i64, u8, u16, u32, u64] => |c, a, b| {
+                       // Use saturating_add to avoid overflow panics in debug builds.
+                       // This produces clamped semantics: values above the max
+                       // become the max, below the min become the min.
+                       *c = a.saturating_add(*b);
+                   });
 
 fn add_quant<T>(c: &mut T, a: &T, b: &T, zp: i32, _: f32)
 where

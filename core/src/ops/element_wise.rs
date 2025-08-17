@@ -100,8 +100,46 @@ impl EvalOp for ElementWiseOp {
     }
 
     fn eval(&self, mut inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
-        if let Some(_dt) = self.0.output_type(inputs[0].datum_type()) {
-            Ok(tvec!(self.0.eval_out_of_place(&inputs[0], self.1)?.into_tvalue()))
+        // If an explicit output datum type was provided, prefer the out-of-place
+        // evaluation path so ops that change datum type (like quantize)
+        // are handled by their out-of-place implementation. Otherwise fall
+        // back to the mini-op's output_type decision.
+        if self.1.is_some() || self.0.output_type(inputs[0].datum_type()).is_some() {
+            // If input is quantized, dequantize to f32 so out-of-place
+            // mini-ops that expect floating inputs can operate correctly.
+            let in_tensor = &inputs[0];
+            let in_dt = in_tensor.datum_type();
+            let eval_input: Tensor = if in_dt.is_quantized() {
+                let (zp, scale) = in_dt.zp_scale();
+                match in_dt.unquantized() {
+                    DatumType::I8 => {
+                        let mut out = unsafe { Tensor::uninitialized::<f32>(in_tensor.shape())? };
+                        in_tensor.as_slice::<i8>()?.iter().zip(out.as_slice_mut::<f32>()?.iter_mut()).for_each(|(x,y)| *y = (*x as i32 - zp as i32) as f32 * scale);
+                        out.into_tensor()
+                    }
+                    DatumType::U8 => {
+                        let mut out = unsafe { Tensor::uninitialized::<f32>(in_tensor.shape())? };
+                        in_tensor.as_slice::<u8>()?.iter().zip(out.as_slice_mut::<f32>()?.iter_mut()).for_each(|(x,y)| *y = (*x as i32 - zp as i32) as f32 * scale);
+                        out.into_tensor()
+                    }
+                    DatumType::I32 => {
+                        let mut out = unsafe { Tensor::uninitialized::<f32>(in_tensor.shape())? };
+                        in_tensor.as_slice::<i32>()?.iter().zip(out.as_slice_mut::<f32>()?.iter_mut()).for_each(|(x,y)| *y = (*x as i32 - zp as i32) as f32 * scale);
+                        out.into_tensor()
+                    }
+                    _ => in_tensor.clone().into_tensor(),
+                }
+            } else {
+                in_tensor.clone().into_tensor()
+            };
+            let mut out = self.0.eval_out_of_place(&eval_input, self.1)?;
+            if let Some(dt) = self.1 {
+                // If caller requested an explicit (possibly quantized) output
+                // datum type, propagate it to the resulting tensor so downstream
+                // ops see the correct quantized type.
+                unsafe { out.set_datum_type(dt) }
+            }
+            Ok(tvec!(out.into_tvalue()))
         } else {
             let mut m = inputs.remove(0).into_tensor();
             self.0.eval_in_place(&mut m, self.1)?;
