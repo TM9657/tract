@@ -105,29 +105,83 @@ pub fn flat_tensor_to_tract_fact<'m>(
     graph: &'m SubGraph<'m>,
     id: i32,
 ) -> TractResult<(TypedFact, &'m str)> {
-    let flat = graph.tensors().unwrap().get(id as _);
+    use tract_data::prelude::QParams;
+
+    // --- get tensor safely
+    let tensors = graph.tensors().ok_or_else(|| format_err!("subgraph has no tensors"))?;
+    let uid = id as usize;
+    if uid >= tensors.len() {
+        bail!("tensor index {} out of range ({} tensors)", uid, tensors.len());
+    }
+    let flat = tensors.get(uid);
+
+    // --- dtype (+ safe quantization)
     let mut dt: DatumType = flat.type_().try_into()?;
+
     if let Some(qp) = flat.quantization() {
-        if let (Some(scale), Some(zp)) = (qp.scale(), qp.zero_point()) {
-            dt = dt.quantize(QParams::ZpScale { zero_point: zp.get(0) as _, scale: scale.get(0) })
+        let scales_opt = qp.scale();
+        let zps_opt    = qp.zero_point();
+
+        let n_scales = scales_opt.map(|v| v.len()).unwrap_or(0);
+        let n_zps    = zps_opt.map(|v| v.len()).unwrap_or(0);
+
+        match (n_scales, n_zps) {
+            (0, 0) => {
+                // quantization block present but empty → treat as unquantized
+            }
+            (1, 1) => {
+                // per-tensor quantization
+                let scale = scales_opt.unwrap().get(0);
+                let zp    = zps_opt.unwrap().get(0);
+                dt = dt.quantize(QParams::ZpScale { zero_point: zp as _, scale });
+            }
+            // If you want to support per-axis later, do it here using qp.quantized_dimension()
+            // and QParams::AffinePerAxis (if available in your tract version).
+            _ => {
+                // Mismatched or per-axis arrays: ignore to avoid panics (or log a warning)
+                // log::warn!("Ignoring unsupported quantization: scales={n_scales}, zps={n_zps}, tensor={}", flat.name().unwrap_or("<unnamed>"));
+            }
         }
     }
-    let mut fact = dt.fact(flat.shape().unwrap().iter().map(|d| d as usize).collect_vec());
+
+    // --- shape (can be missing → scalar)
+    let shape_vec: TVec<usize> = match flat.shape() {
+        Some(s) => s.iter().map(|d| d as usize).collect(),
+        None => tvec![], // scalar
+    };
+    let mut fact = dt.fact(shape_vec);
+
+    // --- constant buffer (guard index)
     let buffer_ix = flat.buffer() as usize;
     if buffer_ix != 0 {
-        let buffer = model.buffers().unwrap().get(flat.buffer() as usize);
+        let buffers = model.buffers().ok_or_else(|| format_err!("model has no buffers"))?;
+        if buffer_ix >= buffers.len() {
+            bail!(
+                "tensor {} refers to out-of-range buffer {} ({} buffers total)",
+                flat.name().unwrap_or("<unnamed>"),
+                buffer_ix,
+                buffers.len()
+            );
+        }
+        let buffer = buffers.get(buffer_ix);
         if let Some(data) = buffer.data() {
+            let shape = fact.shape.as_concrete().ok_or_else(|| {
+                format_err!(
+                    "constant tensor '{}' has non-concrete shape",
+                    flat.name().unwrap_or("<unnamed>")
+                )
+            })?;
             let mut data = create_tensor(
                 fact.datum_type.unquantized(),
-                fact.shape.as_concrete().unwrap(),
+                shape,
                 data.bytes(),
             )?;
-            unsafe {
-                data.set_datum_type(dt);
-            };
+            // keep original (possibly quantized) dtype
+            unsafe { data.set_datum_type(dt); }
             fact = data.into();
         }
     }
+
     Ok((fact, flat.name().unwrap()))
 }
 
