@@ -1,6 +1,6 @@
 use tract_core::internal::*;
 use tract_core::ops::array::{MultiBroadcastTo, Slice, TypedConcat};
-use tract_core::ops::cast::{cast, wire_cast};
+use tract_core::ops::cast::wire_cast;
 use tract_core::ops::Downsample;
 use tract_core::prelude::tract_itertools::Itertools;
 use tract_ndarray::{Array4, ArrayView2};
@@ -8,10 +8,10 @@ use tract_ndarray::{Array4, ArrayView2};
 use crate::registry::{DeserOp, Registry};
 use crate::ser::{BuiltinOp, SubgraphBuilder};
 use crate::tflite::{
-    ActivationFunctionType, BuiltinOperator, BuiltinOptions, CastOptions, ConcatenationOptions,
-    ConcatenationOptionsArgs, ExpandDimsOptions, ExpandDimsOptionsArgs, ResizeBilinearOptions,
+    ActivationFunctionType, BuiltinOperator, BuiltinOptions, ConcatenationOptions,
+    ConcatenationOptionsArgs, ExpandDimsOptions, ExpandDimsOptionsArgs,
     ReshapeOptions, ReshapeOptionsArgs, SliceOptions, SliceOptionsArgs, SqueezeOptions,
-    SqueezeOptionsArgs, StridedSliceOptions, StridedSliceOptionsArgs, TensorType, TransposeOptions,
+    SqueezeOptionsArgs, StridedSliceOptions, StridedSliceOptionsArgs, TransposeOptions,
     TransposeOptionsArgs,
 };
 
@@ -375,7 +375,7 @@ fn de_cast(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
     wire_cast(op.prefix, op.ctx.target, op.inputs, out_dt)
 }
 
-#[derive(Clone, Debug, Hash)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ResizeBilinear {
     h: usize,
     w: usize,

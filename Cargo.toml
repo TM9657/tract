@@ -59,7 +59,7 @@ members = [
     "test-rt/test-onnx-core",
     "test-rt/test-nnef-cycle",
     "test-rt/test-tflite"
-]
+, "tools/try_tflite"]
 
 # same, without metal, test-metal, cuda, test-cuda and test-tflite which are probelematic on specific targets
 default-members = [
@@ -84,6 +84,7 @@ default-members = [
     "api",
     "api/rs",
     "api/ffi",
+    "tools/try_tflite",
 
     "examples/face_detection_yolov8onnx_example",
     "examples/face_similarity_arcface_onnx",

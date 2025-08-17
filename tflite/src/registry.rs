@@ -66,10 +66,28 @@ impl Registry {
         target: &mut TypedModel,
         mapping: &mut HashMap<i32, OutletId>,
     ) -> TractResult<()> {
-        let inputs: TVec<OutletId> =
-            flat_op.inputs().unwrap().iter().map(|o| mapping[&o]).collect();
+        // Build inputs, skipping negative indices (optional tensors in TFLite).
+        let mut inputs: TVec<OutletId> = tvec!();
+        let inputs_vec = flat_op.inputs().unwrap();
+        for i in 0..inputs_vec.len() {
+            let o = inputs_vec.get(i);
+            if o < 0 {
+                continue;
+            }
+            if let Some(&wire) = mapping.get(&o) {
+                inputs.push(wire);
+            } else {
+                bail!("Missing mapping for tensor index {o}");
+            }
+        }
         let tensors = subgraph.tensors().unwrap();
-        let prefix = tensors.get(flat_op.outputs().unwrap().get(0) as usize).name().unwrap();
+        // outputs can also be -1 in malformed models; guard against that when deriving prefix
+        let first_output = flat_op.outputs().unwrap().get(0);
+        let prefix = if first_output >= 0 {
+            tensors.get(first_output as usize).name().unwrap_or("tflite_op")
+        } else {
+            "tflite_op"
+        };
         let opcode_index = flat_op.opcode_index();
         let operator_code = model.operator_codes().unwrap().get(opcode_index as _);
         let opcode = if operator_code.deprecated_builtin_code() as i32

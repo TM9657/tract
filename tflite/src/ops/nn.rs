@@ -69,13 +69,28 @@ fn de_batch_matmul(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
 }
 
 fn de_fully_connected(op: &mut DeserOp) -> TractResult<TVec<OutletId>> {
-    let (input, weights, bias) = args_3!(op.facts()?);
+    // Some exported models may omit the bias (use -1 in inputs). Accept either 2 (no bias)
+    // or 3 (with bias) input facts.
+    let facts = op.facts()?;
+    let (input, weights, bias): (TypedFact, TypedFact, Option<TypedFact>) = match facts.len() {
+        2 => {
+            let (a, b) = args_2!(facts);
+            (a, b, None)
+        }
+        3 => {
+            let (a, b, c) = args_3!(facts);
+            (a, b, Some(c))
+        }
+        _ => bail!("Expected 2 or 3 arg for FullyConnected, got {:?}", facts),
+    };
     let options = builtin!(op, builtin_options_as_fully_connected_options);
     ensure!(options.weights_format() == FullyConnectedOptionsWeightsFormat::DEFAULT);
     ensure!(!options.asymmetric_quantize_inputs());
     ensure!(input.rank() == 2);
     ensure!(weights.rank() == 2);
-    ensure!(bias.rank() == 1);
+    if let Some(ref b) = bias {
+        ensure!(b.rank() == 1);
+    }
     let mut inputs: TVec<OutletId> = op.inputs.into();
     let wires = if input.datum_type.is_float() {
         let axes = "BI,OI->BO".parse()?;
